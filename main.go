@@ -5,6 +5,12 @@ import (
 	"log"
 	"io"
 	"sync/atomic"
+	"time"
+	"sync"
+	"syscall"
+	"os"
+	"context"
+	"os/signal"
 )
 
 const addr = "127.0.0.1:8080"
@@ -52,9 +58,27 @@ func (b *Balancer) LeastConnected() *Backs{
 	return minBack
 }
 
-// func (b *Balancer) healthCheck(){
+func (b *Balancer) healthCheck(sigChan chan os.Signal){
+	ticker := time.NewTicker(5*time.Second)
+	defer ticker.Stop()
 
-// }
+	for {
+		select {
+		case <- sigChan:
+			return
+		case <- ticker.C:
+			for _, v := range b.backs{
+				conn, err := newDial("tcp", v.URL)
+				if err != nil{
+					v.Alive.Store(false)
+					continue
+				}
+				conn.Close()
+				v.Alive.Store(true)
+			}
+		}
+	}
+}
 
 func main(){
 	bal := NewBalancer(Backend)
@@ -63,20 +87,68 @@ func main(){
 	if err != nil{
 		log.Fatal(err)
 	}
-	defer listener.Close()
+	log.Printf("server is listening on %v", listener.Addr().String())
 
-	for{
-		conn, err := listener.Accept()
-		if err != nil{
-			log.Print(err)
-			continue
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	var wg sync.WaitGroup
+	servClosed := make(chan struct{})
+
+	go bal.healthCheck(sigChan)
+
+	go func(){
+		for{
+			conn, err := listener.Accept()
+			if err != nil{
+				select{
+				case <- servClosed:
+					return
+				default:
+					log.Print(err)
+					continue
+				}
+			}
+
+			wg.Add(1)
+			go handleFunc(conn, bal, &wg)
 		}
+	}()
 
-		go handleFunc(conn, bal)
-	}
+	<- sigChan
+	log.Print("closing...")
+	close(servClosed)
+	listener.Close()
+
+	shutdownCtx, stop := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stop()
+
+	done := make(chan struct{})
+
+	go func() {
+        wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        log.Println("All connections are closed")
+    case <-shutdownCtx.Done():
+        log.Println("Timeout. Forced closing")
+    }
 }
 
-func handleFunc(clientConn net.Conn, balancer *Balancer){
+func newDial(network, addres string) (net.Conn, error){
+	d := net.Dialer{
+		Timeout: 15*time.Second,
+		KeepAlive: 30*time.Second,
+	}
+
+	return d.Dial(network, addres)
+}
+
+func handleFunc(clientConn net.Conn, balancer *Balancer, wg *sync.WaitGroup){
+	defer wg.Done()
 	defer clientConn.Close()
 
 	backend := balancer.LeastConnected()
@@ -85,9 +157,9 @@ func handleFunc(clientConn net.Conn, balancer *Balancer){
 		return
 	}
 
-	backConn, err := net.Dial("tcp", backend.URL)
+	backConn, err := newDial("tcp", backend.URL)
 	if err != nil{
-		log.Printf("[err] connecting to %s: %v", backend.URL, err)
+		log.Printf("Handle connections: [err] connecting to %s: %v", backend.URL, err)
 		backend.Alive.Store(false)
 		return
 	}
