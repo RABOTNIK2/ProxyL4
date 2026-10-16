@@ -8,7 +8,6 @@ import (
 	"time"
 	"sync"
 	"syscall"
-	"os"
 	"context"
 	"os/signal"
 )
@@ -58,13 +57,13 @@ func (b *Balancer) LeastConnected() *Backs{
 	return minBack
 }
 
-func (b *Balancer) healthCheck(sigChan chan os.Signal){
+func (b *Balancer) healthCheck(ctx context.Context){
 	ticker := time.NewTicker(5*time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <- sigChan:
+		case <- ctx.Done():
 			return
 		case <- ticker.C:
 			for _, v := range b.backs{
@@ -89,13 +88,13 @@ func main(){
 	}
 	log.Printf("server is listening on %v", listener.Addr().String())
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	var wg sync.WaitGroup
 	servClosed := make(chan struct{})
 
-	go bal.healthCheck(sigChan)
+	go bal.healthCheck(ctx)
 
 	go func(){
 		for{
@@ -115,13 +114,14 @@ func main(){
 		}
 	}()
 
-	<- sigChan
+	<- ctx.Done()
+
 	log.Print("closing...")
 	close(servClosed)
 	listener.Close()
 
-	shutdownCtx, stop := context.WithTimeout(context.Background(), 15*time.Second)
-	defer stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
 	done := make(chan struct{})
 
